@@ -88,25 +88,68 @@ def fetch_from_yahoo(
         [k for kodes in sektor_dict.values() for k in kodes]
     ))
 
-    # Download emiten
-    tickers_yf = [f"{k}.JK" for k in semua_emiten]
-    raw = yf.download(tickers_yf, start=tanggal_mulai, end=tanggal_akhir,
-                      auto_adjust=True, progress=False, threads=True)
+    # Download emiten — pakai session dengan User-Agent browser
+    # untuk menghindari pemblokiran IP datacenter oleh Yahoo Finance
+    import requests, time
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        df_close = raw["Close"].copy()
-    else:
-        df_close = raw[["Close"]].copy()
-        df_close.columns = tickers_yf
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+    })
 
-    df_close.columns = [c.replace(".JK", "") for c in df_close.columns]
-    df_close.index   = pd.to_datetime(df_close.index).normalize()
+    tickers_yf   = [f"{k}.JK" for k in semua_emiten]
+    BATCH_SIZE   = 30   # Download per 30 ticker agar tidak kena rate limit
+    frames_close = []
+
+    for i in range(0, len(tickers_yf), BATCH_SIZE):
+        batch = tickers_yf[i:i + BATCH_SIZE]
+        try:
+            raw_batch = yf.download(
+                batch,
+                start=tanggal_mulai,
+                end=tanggal_akhir,
+                auto_adjust=True,
+                progress=False,
+                threads=False,   # Satu per satu dalam batch agar lebih stabil
+                session=session,
+            )
+            if raw_batch is not None and len(raw_batch) > 0:
+                if isinstance(raw_batch.columns, pd.MultiIndex):
+                    close_batch = raw_batch["Close"].copy()
+                else:
+                    close_batch = raw_batch[["Close"]].copy()
+                    close_batch.columns = batch
+                close_batch.columns = [c.replace(".JK", "") for c in close_batch.columns]
+                frames_close.append(close_batch)
+                log.append(f"Batch {i//BATCH_SIZE + 1}: {len(close_batch.columns)} saham OK")
+        except Exception as e:
+            log.append(f"Batch {i//BATCH_SIZE + 1} gagal: {e}")
+        # Jeda antar batch agar tidak kena rate limit
+        if i + BATCH_SIZE < len(tickers_yf):
+            time.sleep(1)
+
+    if not frames_close:
+        raise ValueError("Semua batch download gagal. Yahoo Finance mungkin sedang down atau IP diblokir.")
+
+    # Gabungkan semua batch
+    df_close = pd.concat(frames_close, axis=1)
+    # Hapus kolom duplikat (emiten yang muncul di lebih dari 1 sektor)
+    df_close = df_close.loc[:, ~df_close.columns.duplicated()]
+    df_close.index = pd.to_datetime(df_close.index).normalize()
     log.append(f"Download selesai: {df_close.shape[1]} saham, {df_close.shape[0]} hari")
 
     # Download IHSG — dengan fallback untuk berbagai versi yfinance
     try:
         raw_ihsg = yf.download("^JKSE", start=tanggal_mulai, end=tanggal_akhir,
-                                auto_adjust=True, progress=False)
+                                auto_adjust=True, progress=False,
+                                threads=False, session=session)
         if raw_ihsg is None or len(raw_ihsg) == 0:
             raise ValueError("data kosong")
         if isinstance(raw_ihsg.columns, pd.MultiIndex):

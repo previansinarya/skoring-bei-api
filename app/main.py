@@ -26,6 +26,6 @@ app.include_router(routes_export.router,    prefix=settings.API_PREFIX)
 def root():
     return {"status": "ok", "message": "Sistem Skoring BEI API berjalan"}
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "healthy"}
