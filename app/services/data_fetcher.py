@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional
 import io
+import warnings
+warnings.filterwarnings('ignore')
 
 
 # ── Konstanta default (bisa di-override dari request) ──────
@@ -88,60 +90,120 @@ def fetch_from_yahoo(
         [k for kodes in sektor_dict.values() for k in kodes]
     ))
 
-    # Download emiten — pakai session dengan User-Agent browser
-    # untuk menghindari pemblokiran IP datacenter oleh Yahoo Finance
+    # Download emiten — coba yfinance dulu, fallback ke stooq jika diblokir
     import requests, time
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-    })
+    tickers_yf = [f"{k}.JK" for k in semua_emiten]
 
-    tickers_yf   = [f"{k}.JK" for k in semua_emiten]
-    BATCH_SIZE   = 30   # Download per 30 ticker agar tidak kena rate limit
-    frames_close = []
+    def download_yfinance(tickers, start, end):
+        """Download via yfinance dengan session browser."""
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        })
+        raw = yf.download(tickers, start=start, end=end,
+                          auto_adjust=True, progress=False,
+                          threads=False, session=session)
+        if raw is None or len(raw) == 0:
+            return None
+        if isinstance(raw.columns, pd.MultiIndex):
+            close = raw["Close"].copy()
+        else:
+            close = raw[["Close"]].copy()
+            close.columns = tickers
+        close.columns = [c.replace(".JK","") for c in close.columns]
+        close.index   = pd.to_datetime(close.index).normalize()
+        # Cek apakah data meaningful (bukan semua NaN)
+        valid = close.columns[close.notna().mean() > 0.5].tolist()
+        if len(valid) < len(tickers) * 0.3:
+            return None   # >70% gagal = trigger fallback
+        return close
 
-    for i in range(0, len(tickers_yf), BATCH_SIZE):
-        batch = tickers_yf[i:i + BATCH_SIZE]
+    def download_stooq(tickers_kode, start, end):
+        """
+        Download via Stooq langsung menggunakan requests + pandas.
+        Tidak butuh library tambahan selain yang sudah ada.
+        Stooq menyediakan data CSV gratis tanpa blokir IP datacenter.
+        """
+        import io as _io
+
+        stooq_session = requests.Session()
+        stooq_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
+        })
+
+        start_str = pd.Timestamp(start).strftime("%Y%m%d")
+        end_str   = pd.Timestamp(end).strftime("%Y%m%d")
+        frames    = []
+        ok_count  = 0
+
+        for kode in tickers_kode:
+            try:
+                ticker_stooq = f"{kode.lower()}.jk"
+                url = (
+                    f"https://stooq.com/q/d/l/"
+                    f"?s={ticker_stooq}&d1={start_str}&d2={end_str}&i=d"
+                )
+                resp = stooq_session.get(url, timeout=10)
+                if resp.status_code != 200 or len(resp.content) < 50:
+                    continue
+                df_t = pd.read_csv(_io.StringIO(resp.text))
+                if "Close" not in df_t.columns or "Date" not in df_t.columns:
+                    continue
+                df_t["Date"] = pd.to_datetime(df_t["Date"]).dt.normalize()
+                s = df_t.set_index("Date")["Close"].rename(kode)
+                if len(s) > 10:
+                    frames.append(s)
+                    ok_count += 1
+            except Exception:
+                pass
+            time.sleep(0.2)   # Jeda kecil antar ticker
+
+        if not frames:
+            return None
+
+        df_out = pd.concat(frames, axis=1).sort_index()
+        return df_out
+
+    # ── Coba yfinance batch dulu ────────────────────────────
+    log.append("Mencoba download via yfinance...")
+    BATCH = 30
+    frames_yf = []
+    yf_success = 0
+
+    for i in range(0, len(tickers_yf), BATCH):
+        batch = tickers_yf[i:i+BATCH]
         try:
-            raw_batch = yf.download(
-                batch,
-                start=tanggal_mulai,
-                end=tanggal_akhir,
-                auto_adjust=True,
-                progress=False,
-                threads=False,   # Satu per satu dalam batch agar lebih stabil
-                session=session,
+            result = download_yfinance(batch, tanggal_mulai, tanggal_akhir)
+            if result is not None and len(result.columns) > 0:
+                frames_yf.append(result)
+                yf_success += len(result.columns)
+        except Exception:
+            pass
+        if i + BATCH < len(tickers_yf):
+            time.sleep(0.5)
+
+    if yf_success >= len(semua_emiten) * 0.3:
+        # yfinance berhasil untuk ≥30% emiten
+        df_close = pd.concat(frames_yf, axis=1)
+        df_close = df_close.loc[:, ~df_close.columns.duplicated()]
+        log.append(f"yfinance OK: {df_close.shape[1]} saham")
+    else:
+        # ── Fallback ke Stooq ───────────────────────────────
+        log.append(f"yfinance diblokir ({yf_success} berhasil). Beralih ke Stooq...")
+        df_close = download_stooq(semua_emiten, tanggal_mulai, tanggal_akhir)
+
+        if df_close is None or len(df_close.columns) == 0:
+            raise ValueError(
+                "Download gagal dari yfinance dan Stooq. "
+                "Gunakan mode Upload File untuk melanjutkan."
             )
-            if raw_batch is not None and len(raw_batch) > 0:
-                if isinstance(raw_batch.columns, pd.MultiIndex):
-                    close_batch = raw_batch["Close"].copy()
-                else:
-                    close_batch = raw_batch[["Close"]].copy()
-                    close_batch.columns = batch
-                close_batch.columns = [c.replace(".JK", "") for c in close_batch.columns]
-                frames_close.append(close_batch)
-                log.append(f"Batch {i//BATCH_SIZE + 1}: {len(close_batch.columns)} saham OK")
-        except Exception as e:
-            log.append(f"Batch {i//BATCH_SIZE + 1} gagal: {e}")
-        # Jeda antar batch agar tidak kena rate limit
-        if i + BATCH_SIZE < len(tickers_yf):
-            time.sleep(1)
+        log.append(f"Stooq OK: {df_close.shape[1]} saham diunduh")
 
-    if not frames_close:
-        raise ValueError("Semua batch download gagal. Yahoo Finance mungkin sedang down atau IP diblokir.")
-
-    # Gabungkan semua batch
-    df_close = pd.concat(frames_close, axis=1)
-    # Hapus kolom duplikat (emiten yang muncul di lebih dari 1 sektor)
-    df_close = df_close.loc[:, ~df_close.columns.duplicated()]
     df_close.index = pd.to_datetime(df_close.index).normalize()
     log.append(f"Download selesai: {df_close.shape[1]} saham, {df_close.shape[0]} hari")
 
