@@ -103,16 +103,27 @@ def fetch_from_yahoo(
     df_close.index   = pd.to_datetime(df_close.index).normalize()
     log.append(f"Download selesai: {df_close.shape[1]} saham, {df_close.shape[0]} hari")
 
-    # Download IHSG
-    raw_ihsg = yf.download("^JKSE", start=tanggal_mulai, end=tanggal_akhir,
-                            auto_adjust=True, progress=False)
-    if isinstance(raw_ihsg.columns, pd.MultiIndex):
-        ihsg_close = raw_ihsg["Close"].iloc[:, 0]
-    else:
-        ihsg_close = raw_ihsg["Close"]
-    ihsg_close.index = pd.to_datetime(ihsg_close.index).normalize()
-    return_ihsg = ihsg_close.pct_change().iloc[1:]
-    log.append(f"IHSG diunduh: {len(return_ihsg)} hari return")
+    # Download IHSG — dengan fallback untuk berbagai versi yfinance
+    try:
+        raw_ihsg = yf.download("^JKSE", start=tanggal_mulai, end=tanggal_akhir,
+                                auto_adjust=True, progress=False)
+        if raw_ihsg is None or len(raw_ihsg) == 0:
+            raise ValueError("data kosong")
+        if isinstance(raw_ihsg.columns, pd.MultiIndex):
+            lvl0 = raw_ihsg.columns.get_level_values(0)
+            if "Close" in lvl0:
+                ihsg_close = raw_ihsg["Close"].iloc[:, 0]
+            else:
+                ihsg_close = raw_ihsg.iloc[:, 0]
+        else:
+            ihsg_close = raw_ihsg["Close"] if "Close" in raw_ihsg.columns else raw_ihsg.iloc[:, 0]
+        ihsg_close = ihsg_close.squeeze()
+        ihsg_close.index = pd.to_datetime(ihsg_close.index).normalize()
+        return_ihsg = ihsg_close.pct_change().iloc[1:]
+        log.append(f"IHSG diunduh: {len(return_ihsg)} hari return")
+    except Exception as e:
+        log.append(f"IHSG gagal diunduh ({e}), beta akan NaN")
+        return_ihsg = pd.Series(dtype=float)
 
     # Preprocessing
     df_return_raw = df_close.pct_change().iloc[1:].copy()

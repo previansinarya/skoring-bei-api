@@ -41,31 +41,40 @@ async def fetch_yahoo(req: RequestFetchYahoo):
             tanggal_akhir=req.tanggal_akhir,
         )
 
+        df_bersih = result["df_bersih"]
+        df_sektor = result["df_sektor"]
+
+        if len(df_bersih.columns) == 0:
+            raise ValueError("Tidak ada emiten valid setelah preprocessing. Coba kurangi threshold missing data atau periksa koneksi internet.")
+
         session_id = str(uuid.uuid4())
         save_session(session_id, {
-            "df_bersih":   result["df_bersih"],
+            "df_bersih":   df_bersih,
             "return_ihsg": result["return_ihsg"],
-            "df_sektor":   result["df_sektor"],
+            "df_sektor":   df_sektor,
             "sumber":      "yahoo_finance",
         })
 
-        sektor_counts = result["df_sektor"]["Sektor"].value_counts().to_dict()
+        sektor_counts = df_sektor["Sektor"].value_counts().to_dict() if len(df_sektor) > 0 else {}
 
         return {
-            "status":         "success",
-            "session_id":     session_id,
-            "n_emiten":       len(result["df_bersih"].columns),
-            "n_hari":         len(result["df_bersih"]),
-            "sektor_counts":  sektor_counts,
-            "log":            result["log"],
-            "periode":        {
-                "mulai": str(result["df_bersih"].index[0].date()),
-                "akhir": str(result["df_bersih"].index[-1].date()),
+            "status":        "success",
+            "session_id":    session_id,
+            "n_emiten":      len(df_bersih.columns),
+            "n_hari":        len(df_bersih),
+            "sektor_counts": sektor_counts,
+            "log":           result["log"],
+            "periode": {
+                "mulai": str(df_bersih.index[0].date()) if len(df_bersih) > 0 else "-",
+                "akhir": str(df_bersih.index[-1].date()) if len(df_bersih) > 0 else "-",
             },
         }
 
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     except Exception as e:
-        raise HTTPException(500, f"Gagal mengunduh data: {str(e)}")
+        import traceback
+        raise HTTPException(500, f"Gagal mengunduh data: {str(e)} | {traceback.format_exc()[-300:]}")
 
 
 @router.post("/upload")
